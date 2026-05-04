@@ -60,7 +60,7 @@ namespace HeartCathAPI.Migrations
 
                     b.HasIndex("StudyId");
 
-                    b.ToTable("AnalysisResults", (string)null);
+                    b.ToTable("AnalysisResults");
                 });
 
             modelBuilder.Entity("HeartCathAPI.Models.PasswordResetOtp", b =>
@@ -90,7 +90,7 @@ namespace HeartCathAPI.Migrations
 
                     b.HasKey("Id");
 
-                    b.ToTable("PasswordResetOtps", (string)null);
+                    b.ToTable("PasswordResetOtps");
                 });
 
             modelBuilder.Entity("HeartCathAPI.Models.Patient", b =>
@@ -136,7 +136,7 @@ namespace HeartCathAPI.Migrations
 
                     b.HasIndex("UserId");
 
-                    b.ToTable("Patients", (string)null);
+                    b.ToTable("Patients");
                 });
 
             modelBuilder.Entity("HeartCathAPI.Models.Study", b =>
@@ -175,7 +175,7 @@ namespace HeartCathAPI.Migrations
 
                     b.HasIndex("UserId");
 
-                    b.ToTable("Studies", (string)null);
+                    b.ToTable("Studies");
                 });
 
             modelBuilder.Entity("HeartCathAPI.Models.User", b =>
@@ -224,7 +224,7 @@ namespace HeartCathAPI.Migrations
                     b.HasIndex("Email")
                         .IsUnique();
 
-                    b.ToTable("Users", (string)null);
+                    b.ToTable("Users");
                 });
 
             modelBuilder.Entity("HeartCathAPI.Models.AnalysisResult", b =>

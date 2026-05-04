@@ -8,7 +8,7 @@ namespace HeartCathAPI.Services.Interfaces
         Task<PatientRequest?> GetByIdAsync(int id);
         Task<PatientRequest> CreateAsync(int userId, CreatePatientRequest dto);
         Task<bool> UpdateAsync(int id, UpdatePatientRequest dto);
-        Task<bool> DeleteAsync(int id);
+        Task<bool> DeleteAsync(int id, int userId);
     }
    
 

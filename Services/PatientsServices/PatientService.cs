@@ -140,11 +140,11 @@ public class PatientService : IPatientService
             return true;
         }
 
-        public async Task<bool> DeleteAsync(int id)
+        public async Task<bool> DeleteAsync(int id, int userId)
         {
             var patient = await _repo.GetByIdAsync(id);
 
-            if (patient == null)
+            if (patient == null || patient.UserId != userId)
                 return false;
 
             _repo.Delete(patient);

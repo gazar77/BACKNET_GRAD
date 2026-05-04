@@ -71,7 +71,11 @@ namespace HeartCathAPI.Areas.Doctor.Controllers
         [HttpDelete("{id}")]
         public async Task<IActionResult> Delete(int id)
         {
-            var deleted = await _service.DeleteAsync(id);
+            var userIdStr = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (userIdStr == null) return Unauthorized();
+            var userId = int.Parse(userIdStr);
+
+            var deleted = await _service.DeleteAsync(id, userId);
 
             if (!deleted)
                 return NotFound();
