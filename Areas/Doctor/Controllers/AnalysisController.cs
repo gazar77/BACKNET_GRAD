@@ -42,8 +42,9 @@ namespace HeartCathAPI.Areas.Doctor.Controllers
             if (study == null)
                 return NotFound("Study not found");
 
+            // Allow re-analysis if status is Processing (stuck from a prior failed run).
             if (study.Status == StudyStatus.Processing)
-                return BadRequest("Study is already processing");
+                study.Status = StudyStatus.Failed;
 
             try
             {

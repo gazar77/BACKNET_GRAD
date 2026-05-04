@@ -4,12 +4,14 @@
 
   1) Optionally uploads app_offline.htm (graceful IIS drain)
   2) dotnet publish (Release, win-x64, framework-dependent) → .\publish\
-  3) Mirrors all files under .\publish\* to FTP remote wwwroot (replaces matching paths)
+  3) FTPs only files that changed since last run (MD5 manifest: .publish-manifest.json), or all with -ForceFullUpload
   4) Deletes app_offline.htm from remote when done
 
   Fill in FTP settings below OR pass parameters:
     .\publish.ps1 -FtpHost "site123.siteasp.net" -FtpUser "site123" -FtpPassword "***" `
         -RemoteWebRoot "wwwroot" -SkipAppOffline
+
+  First run or full resync: .\publish.ps1 -ForceFullUpload
 
   MonsterASP: login often lands in the account root (e.g. mftp), NOT inside the site folder.
   Use -RemoteWebRoot "wwwroot" (default) so files go to .../wwwroot/web.config etc.
@@ -32,7 +34,9 @@ param(
     [string] $RemoteWebRoot = "wwwroot",
     [switch] $SkipAppOffline,
     # Skip TCP check if you know the host is correct but ICMP/Test-NetConnection is blocked
-    [switch] $SkipFtpConnectivityCheck
+    [switch] $SkipFtpConnectivityCheck,
+    # Upload every file (ignore .publish-manifest.json delta); seeds or refreshes the manifest
+    [switch] $ForceFullUpload
 )
 
 # --- Default FTP config (edit here if you prefer not using parameters) ------------
@@ -57,6 +61,7 @@ try {
 
     $publishOut = Join-Path $repoRoot "publish"
     $offlineLocal = Join-Path $repoRoot "app_offline.htm"
+    $ManifestPath = Join-Path $repoRoot ".publish-manifest.json"
 
     Write-Host "[1] Cleaning previous publish folder..." -ForegroundColor Cyan
     if (Test-Path $publishOut) {
@@ -282,6 +287,45 @@ try {
         }
     }
 
+    function Get-FileHashMD5 {
+        param([Parameter(Mandatory)][string]$FilePath)
+        return (Get-FileHash -LiteralPath $FilePath -Algorithm MD5).Hash
+    }
+
+    function Load-Manifest {
+        param([Parameter(Mandatory)][string]$ManifestPath)
+        if (-not (Test-Path -LiteralPath $ManifestPath)) {
+            return @{}
+        }
+        try {
+            $raw = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8
+            if ([string]::IsNullOrWhiteSpace($raw)) {
+                return @{}
+            }
+            $obj = $raw | ConvertFrom-Json
+            if ($null -eq $obj) {
+                return @{}
+            }
+            $ht = @{}
+            foreach ($p in $obj.PSObject.Properties) {
+                $ht[$p.Name] = [string]$p.Value
+            }
+            return $ht
+        }
+        catch {
+            Write-Warning "Could not load manifest ($ManifestPath); uploading all publish files. $($_.Exception.Message)"
+            return @{}
+        }
+    }
+
+    function Save-Manifest {
+        param(
+            [Parameter(Mandatory)][string]$ManifestPath,
+            [Parameter(Mandatory)][hashtable]$Manifest
+        )
+        $Manifest | ConvertTo-Json -Depth 2 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+    }
+
     Write-Host "[2b] FTP target: $FtpAuthorityBase  (TLS: $FtpUseSsl)  remote subdir: '$RemoteWebRoot'" -ForegroundColor DarkGray
 
     if (-not $SkipFtpConnectivityCheck) {
@@ -317,12 +361,45 @@ Try:
 
     Send-AppOfflineIfNeeded
 
-    Write-Host "[3b] FTP upload mirror from publish\ to remote [$RemoteWebRoot] ..." -ForegroundColor Cyan
+    if ($ForceFullUpload) {
+        Write-Host "[3b] FTP upload (full) from publish\ to remote [$RemoteWebRoot] ..." -ForegroundColor Cyan
+    }
+    else {
+        Write-Host "[3b] FTP upload (delta) from publish\ to remote [$RemoteWebRoot] ..." -ForegroundColor Cyan
+        Write-Host "      Manifest: $ManifestPath" -ForegroundColor DarkGray
+    }
+
+    $manifest = Load-Manifest -ManifestPath $ManifestPath
+    $newManifest = @{}
+    $uploadCount = 0
+    $skipCount = 0
+
     Get-ChildItem -Path $publishOut -Recurse -File | ForEach-Object {
         $rel = $_.FullName.Substring($publishOut.Length).TrimStart('\', '/').Replace('\', '/')
-        Write-Host ("  PUT " + $rel)
-        Send-FtpFile -LocalPath $_.FullName -RemoteUnixPath $rel
+        $hash = Get-FileHashMD5 -FilePath $_.FullName
+        $newManifest[$rel] = $hash
+
+        $prev = $null
+        if ($manifest.ContainsKey($rel)) {
+            $prev = [string]$manifest[$rel]
+        }
+        $same = ($null -ne $prev) -and (
+            [string]::Equals($prev.Trim(), $hash, [StringComparison]::OrdinalIgnoreCase)
+        )
+
+        if ($ForceFullUpload -or -not $same) {
+            Write-Host ("  PUT " + $rel)
+            Send-FtpFile -LocalPath $_.FullName -RemoteUnixPath $rel
+            $uploadCount++
+        }
+        else {
+            Write-Host ("  SKIP (unchanged) " + $rel) -ForegroundColor DarkGray
+            $skipCount++
+        }
     }
+
+    Save-Manifest -ManifestPath $ManifestPath -Manifest $newManifest
+    Write-Host ("  Uploaded: {0}  Skipped: {1}" -f $uploadCount, $skipCount) -ForegroundColor Cyan
 
     if (-not $SkipAppOffline) {
         Write-Host "[4] Removing remote app_offline.htm ..." -ForegroundColor Cyan
