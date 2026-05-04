@@ -3,12 +3,10 @@ using HeartCathAPI.Models;
 using HeartCathAPI.Repositories.Interfaces;
 using HeartCathAPI.Services.Interfaces;
 
-namespace HeartCathAPI.Services.Implemtation;
+namespace HeartCathAPI.Services.PatientsServices;
 
-public partial class FileService
+public class PatientService : IPatientService
 {
-    public class PatientService : IPatientService
-    {
         private readonly IPatientRepository _repo;
 
         public PatientService(IPatientRepository repo)
@@ -154,6 +152,4 @@ public partial class FileService
 
             return true;
         }
-    }
-
 }

@@ -4,7 +4,6 @@ using HeartCathAPI.Models.Enums;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
-using System.Diagnostics;
 using System.Security.Claims;
 using System.Net.Http;
 using System.Text.Json;
@@ -19,17 +18,17 @@ namespace HeartCathAPI.Areas.Doctor.Controllers
     {
         private readonly ApplicationDbContext _context;
         private readonly IWebHostEnvironment _env;
+        private readonly string _pythonBaseUrl;
 
-        public AnalysisController(ApplicationDbContext context, IWebHostEnvironment env)
+        public AnalysisController(ApplicationDbContext context, IWebHostEnvironment env, IConfiguration configuration)
         {
             _context = context;
             _env = env;
+            _pythonBaseUrl = (configuration["PythonApi:BaseUrl"] ?? "http://localhost:7860").TrimEnd('/');
         }
 
-        private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
-        private const string PythonApiUrl = "http://localhost:8000";
+        private static readonly HttpClient HttpClientStatic = new() { Timeout = TimeSpan.FromMinutes(5) };
 
-        // تشغيل التحليل
         [HttpPost("{studyId}")]
         [Authorize]
         public async Task<IActionResult> Analyze(int studyId)
@@ -54,36 +53,25 @@ namespace HeartCathAPI.Areas.Doctor.Controllers
                 var wwwroot = _env.WebRootPath;
                 var analysisDir = Path.Combine(wwwroot, "analysis");
                 if (!Directory.Exists(analysisDir))
-                {
                     Directory.CreateDirectory(analysisDir);
-                }
 
-                var pythonScript = Path.Combine(
-                    @"C:\Users\joe Store\OneDrive\Desktop\BaclLastGrad",
-                    "AI",
-                    "angiography_ai.py");
-
-                // Correct path to file in wwwroot
                 var normalizedFilePath = study.FilePath.Replace("/", Path.DirectorySeparatorChar.ToString())
-                                                      .Replace("\\", Path.DirectorySeparatorChar.ToString());
-                
-                var inputPath = Path.Combine(wwwroot, normalizedFilePath);
-                
-                if (!System.IO.File.Exists(inputPath))
-                {
-                    return BadRequest($"Source file not found at: {inputPath}");
-                }
+                    .Replace("\\", Path.DirectorySeparatorChar.ToString());
 
-                // Determine endpoint based on file type
-                string endpoint = study.FileType == StudyFileType.Video ? "/analyze-video" : "/analyze-image";
-                
+                var inputPath = Path.Combine(wwwroot, normalizedFilePath);
+
+                if (!System.IO.File.Exists(inputPath))
+                    return BadRequest($"Source file not found at: {inputPath}");
+
+                var endpoint = study.FileType == StudyFileType.Video ? "/analyze-video" : "/analyze-image";
+
                 using var form = new MultipartFormDataContent();
-                using var fileStream = System.IO.File.OpenRead(inputPath);
-                using var streamContent = new StreamContent(fileStream);
+                await using var fileStream = System.IO.File.OpenRead(inputPath);
+                var streamContent = new StreamContent(fileStream);
                 form.Add(streamContent, "file", Path.GetFileName(inputPath));
 
-                var response = await _httpClient.PostAsync($"{PythonApiUrl}{endpoint}", form);
-                
+                var response = await HttpClientStatic.PostAsync($"{_pythonBaseUrl}{endpoint}", form);
+
                 if (!response.IsSuccessStatusCode)
                 {
                     var errorMsg = await response.Content.ReadAsStringAsync();
@@ -91,24 +79,61 @@ namespace HeartCathAPI.Areas.Doctor.Controllers
                 }
 
                 var jsonResponse = await response.Content.ReadAsStringAsync();
-                var aiResult = JsonDocument.Parse(jsonResponse).RootElement;
+                var root = JsonDocument.Parse(jsonResponse).RootElement;
+                var data = PayloadElement(root);
 
-                double percentage = aiResult.GetProperty("stenosis_percentage").GetDouble();
-                string severity = aiResult.TryGetProperty("severity", out var sevProp) ? sevProp.GetString() ?? "Normal" : "Normal";
-                string artery = aiResult.TryGetProperty("artery_name", out var artProp) ? artProp.GetString() ?? "Coronary Artery" : "Coronary Artery";
-                string diagnosisFromAi = aiResult.TryGetProperty("diagnosis_details", out var diagProp) ? diagProp.GetString() ?? "AI detected stenosis" : "AI detected stenosis";
-                
-                // Copy result overlay image to wwwroot (only for images)
-                var outputImageRel = $"analysis/result_{studyId}.png";
-                var outputImageFull = Path.Combine(wwwroot, "analysis", $"result_{studyId}.png");
+                var percentage = 0d;
+                if (data.TryGetProperty("stenosis_percentage", out var pctEl))
+                    percentage = pctEl.ValueKind == JsonValueKind.Number ? pctEl.GetDouble() : percentage;
 
-                if (study.FileType != StudyFileType.Video && aiResult.TryGetProperty("saved_paths", out var savedPaths))
+                var severity = data.TryGetProperty("severity", out var sevProp)
+                    ? sevProp.GetString() ?? "Normal"
+                    : "Normal";
+
+                var artery = data.TryGetProperty("artery_name", out var artProp)
+                    ? artProp.GetString() ?? "Coronary Artery"
+                    : "Coronary Artery";
+
+                string diagnosisFromAi;
+                if (data.TryGetProperty("diagnosis_details", out var diagProp) &&
+                    diagProp.ValueKind == JsonValueKind.String)
                 {
-                    var overlayPath = savedPaths.GetProperty("overlay_path").GetString();
-                    if (!string.IsNullOrEmpty(overlayPath) && System.IO.File.Exists(overlayPath))
-                    {
-                        System.IO.File.Copy(overlayPath, outputImageFull, true);
-                    }
+                    diagnosisFromAi = diagProp.GetString() ?? string.Empty;
+                }
+                else if (data.TryGetProperty("report", out var reportProp))
+                {
+                    diagnosisFromAi = reportProp.GetString() ?? "Video analysis pending or placeholder.";
+                }
+                else if (data.TryGetProperty("message", out var msgProp))
+                {
+                    diagnosisFromAi = msgProp.GetString() ?? "Analysis complete.";
+                }
+                else
+                {
+                    diagnosisFromAi = "AI detected result.";
+                }
+
+                string imageRef;
+                if (study.FileType == StudyFileType.Video)
+                {
+                    imageRef = string.Empty;
+                }
+                else if (TryGetLegacyOverlayPhysicalPath(root, data, wwwroot, studyId,
+                         out var legacyRel))
+                {
+                    imageRef = legacyRel!;
+                }
+                else if (TryResolveOverlayUrl(data, out var overlayAbsoluteUrl))
+                {
+                    await TryMirrorOverlayAsync(overlayAbsoluteUrl!, wwwroot, studyId).ConfigureAwait(false);
+                    var mirrored = Path.Combine(wwwroot, "analysis", $"result_{studyId}.png");
+                    imageRef = System.IO.File.Exists(mirrored)
+                        ? $"analysis/result_{studyId}.png"
+                        : overlayAbsoluteUrl!;
+                }
+                else
+                {
+                    imageRef = $"analysis/result_{studyId}.png";
                 }
 
                 var result = new AnalysisResult
@@ -116,7 +141,7 @@ namespace HeartCathAPI.Areas.Doctor.Controllers
                     StudyId = studyId,
                     StenosisPercentage = percentage,
                     Report = "AI detected stenosis",
-                    ImagePath = outputImageRel,
+                    ImagePath = imageRef,
                     ArteryName = artery,
                     RiskLevel = severity,
                     DiagnosisDetails = diagnosisFromAi
@@ -146,7 +171,81 @@ namespace HeartCathAPI.Areas.Doctor.Controllers
             }
         }
 
-        // جلب النتيجة
+        private static JsonElement PayloadElement(JsonElement root)
+        {
+            return root.TryGetProperty("data", out var dataEl) ? dataEl : root;
+        }
+
+        private static bool TryGetLegacyOverlayPhysicalPath(JsonElement root, JsonElement dataEl, string wwwroot,
+            int studyId, out string? relativeUnderWwwroot)
+        {
+            relativeUnderWwwroot = null;
+
+            JsonElement savedPathsEl;
+            if (root.TryGetProperty("saved_paths", out savedPathsEl) ||
+                dataEl.TryGetProperty("saved_paths", out savedPathsEl))
+            {
+                if (savedPathsEl.TryGetProperty("overlay_path", out var overlayPathProp))
+                {
+                    var overlayPath = overlayPathProp.GetString();
+                    if (!string.IsNullOrEmpty(overlayPath) && System.IO.File.Exists(overlayPath))
+                    {
+                        var outputImageRel = $"analysis/result_{studyId}.png";
+                        var outputImageFull = Path.Combine(wwwroot, "analysis", $"result_{studyId}.png");
+                        Directory.CreateDirectory(Path.GetDirectoryName(outputImageFull)!);
+                        System.IO.File.Copy(overlayPath, outputImageFull, true);
+                        relativeUnderWwwroot = outputImageRel;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool TryResolveOverlayUrl(JsonElement dataEl, out string? absoluteUrl)
+        {
+            absoluteUrl = null;
+            JsonElement urlsEl;
+            if (!dataEl.TryGetProperty("analysis_metadata", out var meta) ||
+                !meta.TryGetProperty("saved_urls", out urlsEl))
+                return false;
+
+            if (!urlsEl.TryGetProperty("overlay_url", out var ou) ||
+                ou.ValueKind != JsonValueKind.String)
+                return false;
+
+            var relative = ou.GetString();
+            if (string.IsNullOrEmpty(relative))
+                return false;
+
+            absoluteUrl = relative.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                         relative.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+                ? relative
+                : $"{_pythonBaseUrl}{relative}";
+            return true;
+        }
+
+        private static async Task TryMirrorOverlayAsync(string overlayAbsoluteUrl, string wwwroot, int studyId)
+        {
+            try
+            {
+                var outputImageFull = Path.Combine(wwwroot, "analysis", $"result_{studyId}.png");
+                Directory.CreateDirectory(Path.GetDirectoryName(outputImageFull)!);
+                using var getResponse = await HttpClientStatic.GetAsync(overlayAbsoluteUrl).ConfigureAwait(false);
+                if (!getResponse.IsSuccessStatusCode)
+                    return;
+                await using var overlayStream =
+                    await getResponse.Content.ReadAsStreamAsync().ConfigureAwait(false);
+                await using var fileOut = System.IO.File.Create(outputImageFull);
+                await overlayStream.CopyToAsync(fileOut).ConfigureAwait(false);
+            }
+            catch
+            {
+                /* keep remote URL in ImagePath if mirror fails */
+            }
+        }
+
         [HttpGet("{studyId}")]
         public async Task<IActionResult> GetResult(int studyId)
         {

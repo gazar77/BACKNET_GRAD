@@ -5,13 +5,14 @@ using HeartCathAPI.Repositories.Interfaces;
 using HeartCathAPI.Services;
 using HeartCathAPI.Services.AuthServices;
 using HeartCathAPI.Services.Interfaces;
+using HeartCathAPI.Services.PatientsServices;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Scalar.AspNetCore;
 using System.Text;
-using static HeartCathAPI.Services.Implemtation.FileService;
 
 namespace HeartCathAPI
 {
@@ -26,7 +27,12 @@ namespace HeartCathAPI
             builder.Services.AddSwaggerGen();
             builder.Services.AddHttpClient();
 
-            // Increase file upload limit
+            // Large multipart uploads (IIS/Kestrel)
+            builder.Services.Configure<FormOptions>(options =>
+            {
+                options.MultipartBodyLengthLimit = 100 * 1024 * 1024;
+            });
+
             builder.WebHost.ConfigureKestrel(options =>
             {
                 options.Limits.MaxRequestBodySize = 100 * 1024 * 1024; // 100MB
@@ -35,14 +41,12 @@ namespace HeartCathAPI
             builder.Services.AddCors(options =>
             {
                 options.AddPolicy("AllowAll",
-                    builder => builder.AllowAnyOrigin()
-                                      .AllowAnyMethod()
-                                      .AllowAnyHeader());
+                    cors => cors.AllowAnyOrigin()
+                        .AllowAnyMethod()
+                        .AllowAnyHeader());
             });
 
             builder.Services.AddScoped<FileService>();
-
-            // Email Service
             builder.Services.AddScoped<IEmailService, EmailService>();
 
             builder.Services.AddDbContext<ApplicationDbContext>(options =>
@@ -52,7 +56,6 @@ namespace HeartCathAPI
             builder.Services.AddScoped<IPatientRepository, PatientRepository>();
             builder.Services.AddScoped<IPatientService, PatientService>();
 
-            // Authentication
             builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
             builder.Services.AddScoped<IAuthService, AuthService>();
 
@@ -75,26 +78,18 @@ namespace HeartCathAPI
 
             var app = builder.Build();
 
-            // TEMPORARY: Database reset removed to preserve data
-            /*
             using (var scope = app.Services.CreateScope())
             {
-                var services = scope.ServiceProvider;
-                var context = services.GetRequiredService<ApplicationDbContext>();
-                context.Database.EnsureDeleted();
-                context.Database.EnsureCreated();
-            }
-            */
-
-            if (app.Environment.IsDevelopment())
-            {
-                app.MapOpenApi();
-                app.MapScalarApiReference();
-                app.UseSwagger();
-                app.UseSwaggerUI();
+                var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+                db.Database.Migrate();
             }
 
-            // app.UseHttpsRedirection();
+            // Swagger / Scalar in all environments (MonsterASP.NET uses Production by default)
+            app.MapOpenApi();
+            app.MapScalarApiReference();
+            app.UseSwagger();
+            app.UseSwaggerUI();
+
             app.UseStaticFiles();
 
             app.UseCors("AllowAll");

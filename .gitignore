@@ -61,6 +61,9 @@ bld/
 # Entity Framework Core distributed cached model
 *.efdef
 
+# FTP / local publish output
+publish/
+
 # Large binary folders
 wwwroot/analysis/
 wwwroot/dicom/
