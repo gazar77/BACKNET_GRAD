@@ -9,7 +9,14 @@
 
   Fill in FTP settings below OR pass parameters:
     .\publish.ps1 -FtpHost "site123.siteasp.net" -FtpUser "site123" -FtpPassword "***" `
-        -RemoteWebRoot "." -SkipAppOffline
+        -RemoteWebRoot "wwwroot" -SkipAppOffline
+
+  MonsterASP: login often lands in the account root (e.g. mftp), NOT inside the site folder.
+  Use -RemoteWebRoot "wwwroot" (default) so files go to .../wwwroot/web.config etc.
+  Use -RemoteWebRoot "." ONLY if your FTP client already opens inside wwwroot when you connect.
+
+  "Unable to connect to the remote server" = TCP could not reach the FTP host (wrong host/port,
+  firewall/VPN blocking outbound FTP, or server requires FTPS: try -UseFtpSsl).
 #>
 [CmdletBinding()]
 param(
@@ -17,10 +24,15 @@ param(
     [string] $FtpHost = "site67071.siteasp.net",
     [string] $FtpUser = "site67071",
     [string] $FtpPassword = "9Wi@!8YxE_r5",
-    # Remote folder after login. Often FTP root IS the site wwwroot ("." ).
-    # If FileZilla shows a "wwwroot" folder above your files, set to "wwwroot".
-    [string] $RemoteWebRoot = ".",
-    [switch] $SkipAppOffline
+    # Default 21; override if control panel shows another port, or use hostname:port in -FtpHost
+    [int] $FtpPort = 21,
+    # Some hosts require explicit TLS (try if plain FTP connects but login fails, or docs say FTPS)
+    [switch] $UseFtpSsl,
+    # Path UNDER your FTP login directory: MonsterASP = "wwwroot" (matches control panel Website Root \wwwroot).
+    [string] $RemoteWebRoot = "wwwroot",
+    [switch] $SkipAppOffline,
+    # Skip TCP check if you know the host is correct but ICMP/Test-NetConnection is blocked
+    [switch] $SkipFtpConnectivityCheck
 )
 
 # --- Default FTP config (edit here if you prefer not using parameters) ------------
@@ -67,6 +79,64 @@ try {
 
     $cred = New-Object System.Net.NetworkCredential($FtpUser, $FtpPassword.Trim())
 
+    # ----- Resolve ftp://authority (host, optional :port) and whether to use TLS -----------------
+    $ftpRaw = $FtpHost.Trim()
+    $ftpTls = [bool]$UseFtpSsl
+    if ($ftpRaw -match '^(?<scheme>ftps)://') {
+        $ftpTls = $true
+        $ftpRaw = $ftpRaw.Substring($matches[0].Length)
+    }
+    elseif ($ftpRaw -match '^ftp://') {
+        $ftpRaw = $ftpRaw.Substring(6)
+    }
+    $ftpRaw = $ftpRaw.Trim().TrimEnd('/')
+    if ($ftpRaw -match '^([^/]+)') { $ftpRaw = $matches[1] }
+
+    $ftpHostOnly = $ftpRaw
+    $ftpPortEffective = $FtpPort
+    if ($ftpRaw -match '^(.+):(\d+)$') {
+        $ftpHostOnly = $matches[1].Trim()
+        $ftpPortEffective = [int]$matches[2]
+    }
+
+    if ($ftpHostOnly -match '^\[(.+)\]$') {
+        $ftpHostOnly = $matches[1]
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ftpHostOnly)) {
+        throw "FtpHost is empty. Set -FtpHost to the FTP server from MonsterASP (e.g. site123.siteasp.net)."
+    }
+
+    $FtpAuthorityBase = if ($ftpPortEffective -ne 21) {
+        "ftp://$($ftpHostOnly):$ftpPortEffective"
+    } else {
+        "ftp://$ftpHostOnly"
+    }
+    $FtpUseSsl = $ftpTls
+
+    function Test-FtpTcpReachable {
+        param(
+            [string]$ServerHost,
+            [int] $Port,
+            [int] $TimeoutMs = 10000
+        )
+        $c = New-Object System.Net.Sockets.TcpClient
+        try {
+            $iar = $c.BeginConnect($ServerHost, $Port, $null, $null)
+            if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+                return $false
+            }
+            $c.EndConnect($iar)
+            return $c.Connected
+        }
+        catch {
+            return $false
+        }
+        finally {
+            try { $c.Close() } catch { }
+        }
+    }
+
     function New-FtpRequest {
         param(
             [Parameter(Mandatory)][string]$Uri,
@@ -77,7 +147,7 @@ try {
         $request = [System.Net.FtpWebRequest]$request
         $request.Method = $Method
         $request.Credentials = $cred
-        $request.EnableSsl = $false
+        $request.EnableSsl = $FtpUseSsl
         $request.UsePassive = $true
         $request.UseBinary = $true
         $request.KeepAlive = $false
@@ -96,13 +166,7 @@ try {
 
     function Build-FtpUri {
         param([string]$RemoteRelativeUnix)
-        $hostPart = $FtpHost.Trim()
-        if ($hostPart -match '^(ftp|ftps)://') {
-            $base = $hostPart.TrimEnd('/')
-        }
-        else {
-            $base = "ftp://$($hostPart.TrimEnd('/'))"
-        }
+        $base = $FtpAuthorityBase.TrimEnd('/')
 
         $rootSegs = Normalize-RemoteSegments $RemoteWebRoot
         $relSegs = Normalize-RemoteSegments $RemoteRelativeUnix
@@ -115,6 +179,36 @@ try {
             $base = "$base/$enc"
         }
         return $base
+    }
+
+    # mkdir ftp://host/s1/s2/... relative to FTP login root (no RemoteWebRoot prefix)
+    function Build-FtpUriFromLoginRoot {
+        param([string]$RelativePath)
+        $base = $FtpAuthorityBase.TrimEnd('/')
+        foreach ($segment in (Normalize-RemoteSegments $RelativePath)) {
+            $base = "$base/$([Uri]::EscapeDataString($segment))"
+        }
+        return $base
+    }
+
+    function Ensure-FtpDirectoryUnderLoginRoot {
+        param([string]$RelativePath)
+        $segs = Normalize-RemoteSegments $RelativePath
+        if ($segs.Count -eq 0) { return }
+        $built = ""
+        foreach ($seg in $segs) {
+            if ($built) { $built = "$built/$seg" }
+            else { $built = $seg }
+            try {
+                $uri = Build-FtpUriFromLoginRoot $built
+                $req = New-FtpRequest -Uri $uri -Method ([System.Net.WebRequestMethods+Ftp]::MakeDirectory)
+                $resp = $req.GetResponse()
+                $resp.Close() | Out-Null
+            }
+            catch [System.Net.WebException] {
+                # folder may already exist
+            }
+        }
     }
 
     function Invoke-FtpCreateDirectorySafely {
@@ -186,6 +280,28 @@ try {
         catch {
             Write-Warning "Could not delete remote file $RemoteUnixPath : $($_.Exception.Message)"
         }
+    }
+
+    Write-Host "[2b] FTP target: $FtpAuthorityBase  (TLS: $FtpUseSsl)  remote subdir: '$RemoteWebRoot'" -ForegroundColor DarkGray
+
+    if (-not $SkipFtpConnectivityCheck) {
+        Write-Host "[2c] Checking TCP ${ftpHostOnly}:$ftpPortEffective ..." -ForegroundColor Cyan
+        if (-not (Test-FtpTcpReachable -ServerHost $ftpHostOnly -Port $ftpPortEffective)) {
+            throw @"
+Cannot reach FTP server at ${ftpHostOnly}:$ftpPortEffective (TCP connect failed).
+
+Try:
+  - Hostname from MonsterASP FTP page (often siteNNNNN.siteasp.net), no accidental spaces
+  - Another network / disable VPN or try VPN if FTP is blocked (many Wi‑Fi/corp networks block outbound port 21)
+  - Correct port: -FtpPort 2121 or -FtpHost 'hostname:2121' if the control panel shows a custom port
+  - FTPS if required: -UseFtpSsl
+  - Skip this check only if you are sure: -SkipFtpConnectivityCheck
+"@
+        }
+    }
+
+    if ($RemoteWebRoot -ne ".") {
+        Ensure-FtpDirectoryUnderLoginRoot $RemoteWebRoot
     }
 
     function Send-AppOfflineIfNeeded {

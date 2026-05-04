@@ -78,11 +78,34 @@ namespace HeartCathAPI
 
             var app = builder.Build();
 
-            using (var scope = app.Services.CreateScope())
+            // Failures here cause IIS HTTP 500.30 — log to /logs so you can read via FTP.
+            try
             {
-                var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-                db.Database.Migrate();
+                using (var scope = app.Services.CreateScope())
+                {
+                    var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+                    db.Database.Migrate();
+                }
             }
+            catch (Exception ex)
+            {
+                try
+                {
+                    var logDir = Path.Combine(app.Environment.ContentRootPath, "logs");
+                    Directory.CreateDirectory(logDir);
+                    var logPath = Path.Combine(logDir, "migration-failure.txt");
+                    File.WriteAllText(logPath,
+                        $"{DateTime.UtcNow:O} UTC\n{ex}\n");
+                }
+                catch
+                {
+                    /* ignore secondary errors */
+                }
+
+                throw;
+            }
+
+            app.MapGet("/health", () => Results.Json(new { status = "ok", time = DateTime.UtcNow }));
 
             // Swagger / Scalar in all environments (MonsterASP.NET uses Production by default)
             app.MapOpenApi();
