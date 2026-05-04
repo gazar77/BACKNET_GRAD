@@ -61,8 +61,7 @@ bld/
 # Entity Framework Core distributed cached model
 *.efdef
 
-# FTP / local publish output (delta upload hash manifest; machine-local)
-.publish-manifest.json
+# FTP / local publish output
 publish/
 
 # Large binary folders

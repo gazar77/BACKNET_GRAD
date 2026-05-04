@@ -4,14 +4,14 @@
 
   1) Optionally uploads app_offline.htm (graceful IIS drain)
   2) dotnet publish (Release, win-x64, framework-dependent) → .\publish\
-  3) FTPs only files that changed since last run (MD5 manifest: .publish-manifest.json), or all with -ForceFullUpload
+  3) FTPs only files whose size differs from the remote (FTP SIZE); use -ForceFullUpload to PUT every file
   4) Deletes app_offline.htm from remote when done
 
   Fill in FTP settings below OR pass parameters:
     .\publish.ps1 -FtpHost "site123.siteasp.net" -FtpUser "site123" -FtpPassword "***" `
         -RemoteWebRoot "wwwroot" -SkipAppOffline
 
-  First run or full resync: .\publish.ps1 -ForceFullUpload
+  Full resync (ignore remote size, upload all): .\publish.ps1 -ForceFullUpload
 
   MonsterASP: login often lands in the account root (e.g. mftp), NOT inside the site folder.
   Use -RemoteWebRoot "wwwroot" (default) so files go to .../wwwroot/web.config etc.
@@ -35,7 +35,7 @@ param(
     [switch] $SkipAppOffline,
     # Skip TCP check if you know the host is correct but ICMP/Test-NetConnection is blocked
     [switch] $SkipFtpConnectivityCheck,
-    # Upload every file (ignore .publish-manifest.json delta); seeds or refreshes the manifest
+    # Upload every publish file without comparing FTP remote file size first
     [switch] $ForceFullUpload
 )
 
@@ -61,7 +61,6 @@ try {
 
     $publishOut = Join-Path $repoRoot "publish"
     $offlineLocal = Join-Path $repoRoot "app_offline.htm"
-    $ManifestPath = Join-Path $repoRoot ".publish-manifest.json"
 
     Write-Host "[1] Cleaning previous publish folder..." -ForegroundColor Cyan
     if (Test-Path $publishOut) {
@@ -234,18 +233,11 @@ try {
                 $resp.Close() | Out-Null
             }
             catch [System.Net.WebException] {
-                # Ignore "already exists"; rethrow unexpected errors
-                if ($_.Exception.Response -eq $null) { throw $_ }
-                $resp = try { [System.Net.FtpWebResponse]$_.Exception.Response } catch { $null }
-                $codeOk = $false
-                if ($resp -ne $null -and $resp.StatusCode.ToString()) {
-                    $txt = [string]$resp.StatusCode.ToString().ToUpperInvariant()
-                    if ($txt.Contains("EXIST") -or $txt.Contains("FILENAME") ) { $codeOk = $true }
-                    $resp.Close() | Out-Null
-                }
-                if (-not $codeOk) {
-                    Write-Warning ("Could not create remote directory (may exist): $uri -> " + ($_.Exception.Message))
-                }
+                # 550 "already exists" is normal and expected — silently continue.
+                # If the directory cannot actually be created, the upload will fail with a clear error.
+                $resp = $null
+                try { $resp = [System.Net.FtpWebResponse]$_.Exception.Response } catch { }
+                if ($resp -ne $null) { try { $resp.Close() } catch { } }
             }
         }
     }
@@ -287,43 +279,19 @@ try {
         }
     }
 
-    function Get-FileHashMD5 {
-        param([Parameter(Mandatory)][string]$FilePath)
-        return (Get-FileHash -LiteralPath $FilePath -Algorithm MD5).Hash
-    }
-
-    function Load-Manifest {
-        param([Parameter(Mandatory)][string]$ManifestPath)
-        if (-not (Test-Path -LiteralPath $ManifestPath)) {
-            return @{}
-        }
+    function Get-RemoteFileSize {
+        param([Parameter(Mandatory)][string]$RemoteUnixPath)
+        $uri = Build-FtpUri $RemoteUnixPath
         try {
-            $raw = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8
-            if ([string]::IsNullOrWhiteSpace($raw)) {
-                return @{}
-            }
-            $obj = $raw | ConvertFrom-Json
-            if ($null -eq $obj) {
-                return @{}
-            }
-            $ht = @{}
-            foreach ($p in $obj.PSObject.Properties) {
-                $ht[$p.Name] = [string]$p.Value
-            }
-            return $ht
+            $req = New-FtpRequest -Uri $uri -Method ([System.Net.WebRequestMethods+Ftp]::GetFileSize)
+            $resp = [System.Net.FtpWebResponse]$req.GetResponse()
+            $size = $resp.ContentLength
+            $resp.Close()
+            return $size
         }
         catch {
-            Write-Warning "Could not load manifest ($ManifestPath); uploading all publish files. $($_.Exception.Message)"
-            return @{}
+            return -1   # file does not exist on remote
         }
-    }
-
-    function Save-Manifest {
-        param(
-            [Parameter(Mandatory)][string]$ManifestPath,
-            [Parameter(Mandatory)][hashtable]$Manifest
-        )
-        $Manifest | ConvertTo-Json -Depth 2 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
     }
 
     Write-Host "[2b] FTP target: $FtpAuthorityBase  (TLS: $FtpUseSsl)  remote subdir: '$RemoteWebRoot'" -ForegroundColor DarkGray
@@ -365,40 +333,28 @@ Try:
         Write-Host "[3b] FTP upload (full) from publish\ to remote [$RemoteWebRoot] ..." -ForegroundColor Cyan
     }
     else {
-        Write-Host "[3b] FTP upload (delta) from publish\ to remote [$RemoteWebRoot] ..." -ForegroundColor Cyan
-        Write-Host "      Manifest: $ManifestPath" -ForegroundColor DarkGray
+        Write-Host "[3b] FTP upload (delta by remote file size vs local publish) [$RemoteWebRoot] ..." -ForegroundColor Cyan
     }
 
-    $manifest = Load-Manifest -ManifestPath $ManifestPath
-    $newManifest = @{}
     $uploadCount = 0
     $skipCount = 0
 
     Get-ChildItem -Path $publishOut -Recurse -File | ForEach-Object {
         $rel = $_.FullName.Substring($publishOut.Length).TrimStart('\', '/').Replace('\', '/')
-        $hash = Get-FileHashMD5 -FilePath $_.FullName
-        $newManifest[$rel] = $hash
+        $localSize = $_.Length
+        $remoteSize = if ($ForceFullUpload) { -1 } else { Get-RemoteFileSize -RemoteUnixPath $rel }
 
-        $prev = $null
-        if ($manifest.ContainsKey($rel)) {
-            $prev = [string]$manifest[$rel]
+        if ($remoteSize -eq $localSize) {
+            Write-Host ("  SKIP (same size {0} B) {1}" -f $localSize, $rel) -ForegroundColor DarkGray
+            $skipCount++
         }
-        $same = ($null -ne $prev) -and (
-            [string]::Equals($prev.Trim(), $hash, [StringComparison]::OrdinalIgnoreCase)
-        )
-
-        if ($ForceFullUpload -or -not $same) {
-            Write-Host ("  PUT " + $rel)
+        else {
+            Write-Host ("  PUT  {0}" -f $rel)
             Send-FtpFile -LocalPath $_.FullName -RemoteUnixPath $rel
             $uploadCount++
         }
-        else {
-            Write-Host ("  SKIP (unchanged) " + $rel) -ForegroundColor DarkGray
-            $skipCount++
-        }
     }
 
-    Save-Manifest -ManifestPath $ManifestPath -Manifest $newManifest
     Write-Host ("  Uploaded: {0}  Skipped: {1}" -f $uploadCount, $skipCount) -ForegroundColor Cyan
 
     if (-not $SkipAppOffline) {
