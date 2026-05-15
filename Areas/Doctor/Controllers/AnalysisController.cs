@@ -115,11 +115,7 @@ namespace HeartCathAPI.Areas.Doctor.Controllers
                 }
 
                 string imageRef;
-                if (study.FileType == StudyFileType.Video)
-                {
-                    imageRef = string.Empty;
-                }
-                else if (TryGetLegacyOverlayPhysicalPath(root, data, wwwroot, studyId,
+                if (TryGetLegacyOverlayPhysicalPath(root, data, wwwroot, studyId,
                          out var legacyRel))
                 {
                     imageRef = legacyRel!;
